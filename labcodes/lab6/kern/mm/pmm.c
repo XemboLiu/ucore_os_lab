@@ -396,6 +396,18 @@ get_pte(pde_t *pgdir, uintptr_t la, bool create) {
     }
     return NULL;          // (8) return page table entry
 #endif
+    pde_t *pdep = &pgdir[PDX(la)];
+    if (!(*pdep & PTE_P)){
+	struct Page *page;
+	if (!create || (page = alloc_page()) == NULL){
+	    return NULL;
+	}
+	set_page_ref(page, 1);
+	uintptr_t pa = page2pa(page);
+	memset(KADDR(pa), 0, PGSIZE);
+	*pdep = pa | PTE_P | PTE_W | PTE_U;
+    }
+    return &((pte_t *)KADDR(PDE_ADDR(*pdep)))[PTX(la)];
 }
 
 //get_page - get related Page struct for linear address la using PDT pgdir
@@ -441,6 +453,14 @@ page_remove_pte(pde_t *pgdir, uintptr_t la, pte_t *ptep) {
                                   //(6) flush tlb
     }
 #endif
+    if (*ptep & PTE_P){
+        struct Page *p = pte2page(*ptep);
+        if (page_ref_dec(p) == 0){
+	    free_page(p);
+	}
+	*ptep = 0;
+	tlb_invalidate(pgdir, la);
+    }
 }
 
 void
@@ -522,6 +542,10 @@ copy_range(pde_t *to, pde_t *from, uintptr_t start, uintptr_t end, bool share) {
          * (3) memory copy from src_kvaddr to dst_kvaddr, size is PGSIZE
          * (4) build the map of phy addr of  nage with the linear addr start
          */
+        uintptr_t src_kvaddr = page2kva(page);
+        uintptr_t dst_kvaddr = page2kva(npage);
+        memcpy(dst_kvaddr, src_kvaddr, PGSIZE);
+        *nptep = (page2pa(npage) & 0xfffff000) | PTE_P | PTE_W | PTE_U;
         assert(ret == 0);
         }
         start += PGSIZE;

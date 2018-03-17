@@ -96,12 +96,14 @@ default_alloc_pages(size_t n) {
         }
     }
     if (page != NULL) {
+        list_entry_t* previous_node_ptr = list_prev(&(page->page_link));
         list_del(&(page->page_link));
         if (page->property > n) {
             struct Page *p = page + n;
             p->property = page->property - n;
-            list_add(&free_list, &(p->page_link));
-    }
+            list_add(previous_node_ptr, &(p->page_link));
+            SetPageProperty(p);
+        }
         nr_free -= n;
         ClearPageProperty(page);
     }
@@ -117,26 +119,46 @@ default_free_pages(struct Page *base, size_t n) {
         p->flags = 0;
         set_page_ref(p, 0);
     }
-    base->property = n;
-    SetPageProperty(base);
-    list_entry_t *le = list_next(&free_list);
-    while (le != &free_list) {
-        p = le2page(le, page_link);
-        le = list_next(le);
-        if (base + base->property == p) {
-            base->property += p->property;
-            ClearPageProperty(p);
-            list_del(&(p->page_link));
-        }
-        else if (p + p->property == base) {
-            p->property += base->property;
-            ClearPageProperty(base);
-            base = p;
-            list_del(&(p->page_link));
+
+    list_entry_t *le = NULL;
+    int found_free_page_after = 0;
+    struct Page *free_page_after = NULL;
+    for(le = list_next(&free_list); le != &free_list; le = list_next(le)) {
+        struct Page* page = le2page(le, page_link);
+        if(base < page) {
+            found_free_page_after = 1;
+            free_page_after = page;
+            break;
         }
     }
+    if(found_free_page_after) {
+        list_add_before(&(free_page_after->page_link), &(base->page_link));
+    }
+    else {
+        list_add_before(&free_list, &(base->page_link));
+    }
+    base->property = n;
+    SetPageProperty(base);
     nr_free += n;
-    list_add(&free_list, &(base->page_link));
+    for(;;) {
+        list_entry_t* le_prev = list_prev(&(base->page_link));
+        if(le_prev == &free_list) break;
+        struct Page* prev = le2page(le_prev, page_link);
+        if(prev + prev->property != base) break;
+        prev->property += base->property;
+        list_del(&(base->page_link));
+        ClearPageProperty(base);
+        base = prev;
+    }
+    for(;;) {
+        list_entry_t* le_next = list_next(&(base->page_link));
+        if(le_next == &free_list) break;
+        struct Page* next = le2page(le_next, page_link);
+        if(base + base->property != next) break;
+        base->property += next->property;
+        list_del(&(next->page_link));
+        ClearPageProperty(next);
+    }
 }
 
 static size_t

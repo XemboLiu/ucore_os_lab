@@ -123,6 +123,27 @@ alloc_proc(void) {
      *     uint32_t lab6_priority;                     // FOR LAB6 ONLY: the priority of process, set by lab6_set_priority(uint32_t)
      */
     //LAB8:EXERCISE2 YOUR CODE HINT:need add some code to init fs in proc_struct, ...
+        proc->state = PROC_UNINIT;
+        proc->pid = 0;
+        proc->runs = 0;
+        proc->kstack = 0;
+        proc->need_resched = 0;
+        proc->parent = NULL;
+        proc->mm = NULL;
+        proc->tf = NULL;
+        proc->cr3 = boot_cr3;
+        proc->flags = 0;
+        memset(&(proc->context), 0, sizeof(struct context));
+        proc->name[0] = '\0';
+        proc->wait_state = 0;
+        proc->cptr = NULL;
+        proc->yptr = NULL;
+        proc->optr = NULL;
+        proc->rq = NULL;
+        proc->time_slice = 0;
+        proc->lab6_stride = 0;
+        proc->lab6_priority = 0;
+        proc -> filesp = NULL;
     }
     return proc;
 }
@@ -461,7 +482,23 @@ do_fork(uint32_t clone_flags, uintptr_t stack, struct trapframe *tf) {
 	*    update step 1: set child proc's parent to current process, make sure current process's wait_state is 0
 	*    update step 5: insert proc_struct into hash_list && proc_list, set the relation links of process
     */
-	
+    proc = alloc_proc();
+    assert(current->wait_state == 0);
+    if(proc == NULL)
+        goto fork_out;
+    proc -> parent = current;
+    if(setup_kstack(proc) != 0)
+        goto bad_fork_cleanup_proc;
+    if(copy_files(clone_flags, proc) != 0)
+        goto bad_fork_cleanup_kstack;
+    if(copy_mm(clone_flags, proc) != 0)
+        goto bad_fork_cleanup_fs;
+    proc->pid = get_pid();
+    copy_thread(proc, stack, tf);
+    hash_proc(proc);
+    set_links(proc);
+    wakeup_proc(proc);
+    ret = proc->pid;
 fork_out:
     return ret;
 
@@ -573,6 +610,102 @@ load_icode(int fd, int argc, char **kargv) {
      * (7) setup trapframe for user environment
      * (8) if up steps failed, you should cleanup the env.
      */
+    struct mm_struct* memory_manager = mm_create();
+    setup_pgdir(memory_manager);
+    struct elfhdr elf_header;
+    if(load_icode_read(fd, &elf_header, sizeof(elf_header), 0) != 0 ||
+    elf_header.e_magic != ELF_MAGIC) {
+        put_pgdir(memory_manager);
+        mm_destroy(memory_manager);
+        return -E_INVAL_ELF;
+    }
+    int i;
+    for(i = 0; i < elf_header.e_phnum; i++) {
+        struct proghdr program_header;
+        if(load_icode_read(fd, &program_header, sizeof(program_header),
+        elf_header.e_phoff + i * sizeof(program_header)) != 0) {
+            put_pgdir(memory_manager);
+            mm_destroy(memory_manager);
+            return -E_INVAL_ELF;
+        }
+        if(program_header.p_type != ELF_PT_LOAD) continue;
+        uint32_t vm_flags = 0, perm = PTE_U;
+        if(program_header.p_flags & ELF_PF_X) vm_flags |= VM_EXEC;
+        if(program_header.p_flags & ELF_PF_W) vm_flags |= VM_WRITE;
+        if(program_header.p_flags & ELF_PF_R) vm_flags |= VM_READ;
+        if(vm_flags & VM_WRITE) perm |= PTE_W;
+        mm_map(memory_manager, program_header.p_va, program_header.p_memsz, vm_flags, NULL);
+        uintptr_t current_user_addr = program_header.p_va;
+        uintptr_t current_user_addr_aligned = current_user_addr / PGSIZE * PGSIZE;
+        uintptr_t end_user_addr = program_header.p_va + program_header.p_filesz;
+        uintptr_t current_pos_in_file = program_header.p_offset;
+        struct Page* page;
+        while(current_user_addr < end_user_addr) {
+            uint32_t copy_size = PGSIZE;
+            uint32_t in_page_offset = 0;
+            if(current_user_addr & 0xFFF) {
+                in_page_offset = current_user_addr & 0xFFF;
+                copy_size -= in_page_offset;
+            }
+            page = pgdir_alloc_page(memory_manager->pgdir, current_user_addr_aligned, perm);
+            current_user_addr_aligned += PGSIZE;
+            if(end_user_addr < current_user_addr_aligned) {
+                copy_size -= current_user_addr_aligned - end_user_addr;
+            }
+            load_icode_read(fd, page2kva(page) + in_page_offset, copy_size,
+                current_pos_in_file);
+            current_user_addr += copy_size;
+            current_pos_in_file += copy_size;
+        }
+        end_user_addr = program_header.p_va + program_header.p_memsz;
+        while(current_user_addr < end_user_addr) {
+            uint32_t in_page_offset = 0;
+            uint32_t copy_size = PGSIZE;
+            if(current_user_addr < current_user_addr_aligned) {
+                in_page_offset = current_user_addr + PGSIZE - current_user_addr_aligned;
+                copy_size -= in_page_offset;
+            }
+            else {
+                page = pgdir_alloc_page(memory_manager->pgdir, current_user_addr_aligned, perm);
+                current_user_addr_aligned += PGSIZE;
+            }
+            if(end_user_addr < current_user_addr_aligned) {
+                copy_size -= current_user_addr_aligned - end_user_addr;
+            }
+            memset(page2kva(page) + in_page_offset, 0, copy_size);
+            current_user_addr += copy_size;
+        }
+    }
+    sysfile_close(fd);
+    mm_map(memory_manager, USTACKTOP - USTACKSIZE, USTACKSIZE,
+        VM_READ | VM_WRITE | VM_STACK, NULL);
+    for(i = 1; i <= 4; i++) {
+        pgdir_alloc_page(memory_manager->pgdir, USTACKTOP - PGSIZE * i, PTE_USER);
+    }
+    mm_count_inc(memory_manager);
+    current->mm = memory_manager;
+    current->cr3 = PADDR(memory_manager->pgdir);
+    lcr3(PADDR(memory_manager->pgdir));
+    int stack_pos = USTACKTOP;
+    char** user_argv[EXEC_MAX_ARG_LEN];
+    for(i = 0; i < argc; i++) {
+        int len = strlen(kargv[i]) + 1;
+        stack_pos -= len;
+        user_argv[i] = user_argv;
+        memcpy(stack_pos, kargv[i], len);
+    }
+    stack_pos -= argc * sizeof(char*);
+    memcpy(stack_pos, user_argv, argc * sizeof(char*));
+    stack_pos -= sizeof(char*);
+    memcpy(stack_pos, &argc, sizeof(int));
+    struct trapframe *tf = current->tf;
+    memset(tf, 0, sizeof(struct trapframe));
+    tf->tf_cs = USER_CS;
+    tf->tf_ds = tf->tf_es = tf->tf_ss = USER_DS;
+    tf->tf_esp = stack_pos;
+    tf->tf_eip = elf_header.e_entry;
+    tf->tf_eflags |= FL_IF;
+    return 0;
 }
 
 // this function isn't very correct in LAB8

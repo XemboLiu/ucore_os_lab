@@ -599,6 +599,52 @@ sfs_io_nolock(struct sfs_fs *sfs, struct sfs_inode *sin, void *buf, off_t offset
      * (3) If end position isn't aligned with the last block, Rd/Wr some content from begin to the (endpos % SFS_BLKSIZE) of the last block
 	 *       NOTICE: useful function: sfs_bmap_load_nolock, sfs_buf_op	
 	*/
+    uint32_t unaligned_size_before = (blkno + 1) * SFS_BLKSIZE - offset;
+    uint32_t unaligned_size_after = endpos - (endpos / SFS_BLKSIZE) * SFS_BLKSIZE;
+    if(nblks == 0)
+    {
+        if(sfs_bmap_load_nolock(sfs, sin, blkno, &ino) != 0)
+            goto out;
+        if(sfs_buf_op(sfs, buf, endpos - offset, ino,
+        SFS_BLKSIZE - unaligned_size_before) != 0)
+            goto out;
+        alen += (endpos - offset);
+        goto out;
+    }
+
+    if(unaligned_size_before > 0) {
+        if(sfs_bmap_load_nolock(sfs, sin, blkno, &ino) != 0)
+            goto out;
+        if(sfs_buf_op(sfs, buf, unaligned_size_before, ino,
+        SFS_BLKSIZE - unaligned_size_before) != 0) {
+            goto out;
+        }
+        alen += unaligned_size_before;
+        buf += unaligned_size_before;
+        blkno++;
+        nblks--;
+    }
+    int i;
+    for(i = 0; i < nblks; i++)
+    {
+        if (sfs_bmap_load_nolock(sfs, sin, blkno + i, &ino) != 0)
+            goto out;
+        if (sfs_block_op(sfs, buf, ino, 1) != 0) {
+            goto out;
+        }
+        buf += SFS_BLKSIZE;
+        alen += SFS_BLKSIZE;
+    }
+
+    if(unaligned_size_after > 0) {
+        if(sfs_bmap_load_nolock(sfs, sin, blkno + nblks, &ino) != 0)
+            goto out;
+        if(sfs_buf_op(sfs, buf, unaligned_size_after, ino, 0) != 0) {
+            goto out;
+        }
+        alen += unaligned_size_after;
+        buf += unaligned_size_after;
+    }
 out:
     *alenp = alen;
     if (offset + alen > sin->din->size) {
